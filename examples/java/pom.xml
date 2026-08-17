@@ -7,7 +7,7 @@
 
     <groupId>com.roomzin.example</groupId>
     <artifactId>roomzin-smoke-test</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -21,7 +21,7 @@
         <dependency>
             <groupId>io.github.m-javani</groupId>
             <artifactId>roomzin-java</artifactId>
-            <version>1.0.0</version>
+            <version>2.0.0</version>
         </dependency>
 
         <!-- Logging (SDK uses SLF4J) -->

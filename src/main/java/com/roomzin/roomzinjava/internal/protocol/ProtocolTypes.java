@@ -3,6 +3,19 @@ package com.roomzin.roomzinjava.internal.protocol;
 import java.util.List;
 
 public class ProtocolTypes {
+
+    // Constants
+    public static final byte SHARD_MAGIC = (byte) 0xFF;
+    public static final byte ROUTER_MAGIC = (byte) 0xFE;
+    public static final String CODEC_SEGMENT = "__codecs__";
+    public static final String KEEPALIVE_SEGMENT = "__keepalive__";
+
+    // Connection Mode
+    public enum Mode {
+        STANDALONE,
+        ROUTER
+    }
+
     public static class Header {
         public final int clrId; // uint32
         public final String status;

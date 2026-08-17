@@ -1,10 +1,8 @@
 package smoke;
 
-import com.roomzin.roomzinjava.api.CacheClientApi;
-import com.roomzin.roomzinjava.client.cluster.ClusterClient;
-import com.roomzin.roomzinjava.client.cluster.ClusterConfig;
-import com.roomzin.roomzinjava.client.single.SingleClient;
-import com.roomzin.roomzinjava.client.single.SingleConfig;
+import com.roomzin.roomzinjava.client.RoomzinClient;
+import com.roomzin.roomzinjava.client.RoomzinConfig;
+import com.roomzin.roomzinjava.internal.protocol.ProtocolTypes;
 import com.roomzin.roomzinjava.internal.protocol.RoomzinException;
 import com.roomzin.roomzinjava.types.*;
 
@@ -12,118 +10,147 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-/**
- * Roomzin Smoke Test - API Usage Example & Implicit Test
- * 
- * This file serves two purposes:
- * 1. Demonstrates how to use the Roomzin Java SDK
- * 2. Acts as an implicit integration test for Roomzin servers
- * 
- * To run: mvn exec:java
- */
 public class RoomzinSmoke {
     // ============================================================================
-    // CONFIGURATION - Change these to match your environment
+    // CONFIGURATION
     // ============================================================================
 
-    // Change this to "standalone" to test against a single Roomzin instance
-    private static final String MODE = "standalone";
+    private static final String MODE = "router";
 
     // Standalone configuration
     private static final String STANDALONE_HOST = "127.0.0.1";
     private static final int STANDALONE_PORT = 7777;
-    private static final String TOKEN = "abc123";
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
 
-    // Cluster configuration (update these IPs to match your cluster)
-    private static final List<NodeAddr> STATIC_DISCOVERY = Arrays.asList(
-            new NodeAddr("roomzin-0", "172.20.0.10", 7777, 8080),
-            new NodeAddr("roomzin-1", "172.20.0.11", 7777, 8080),
-            new NodeAddr("roomzin-2", "172.20.0.12", 7777, 8080));
+    // Cluster configuration (router address)
+    private static final String ROUTER_HOST = "127.0.0.1";
+    private static final int ROUTER_PORT = 9200;
 
-    // Test data parameters
-    private static final int NUM_SEGMENTS = 2;
-    private static final int NUM_PROPS_PER_SEGMENT = 1000;
-    private static final int NUM_ROOMS_PER_PROP = 2;
-    private static final int NUM_DAYS = 3;
+    // Test data parameters - matches generator.py
+    private static final int NUM_SEGMENTS = 4;
+    private static final int NUM_PROPS_PER_SEGMENT = 10;
+    private static final int NUM_ROOMS_PER_PROP = 4;
+    private static final int NUM_DAYS = 10;
+    private static final int SHARD_IDX = 1;
 
-    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    // ============================================================================
+    // TIMING HELPERS
+    // ============================================================================
+
+    static class StepTiming {
+        String name;
+        Duration duration;
+        int requestCount;
+
+        StepTiming(String name, Duration duration, int requestCount) {
+            this.name = name;
+            this.duration = duration;
+            this.requestCount = requestCount;
+        }
+    }
+
+    private static final List<StepTiming> timings = new ArrayList<>();
+
+    private static void timeStep(String name, int requestCount, ThrowingRunnable fn) throws Exception {
+        long start = System.nanoTime();
+        try {
+            fn.run();
+            Duration duration = Duration.ofNanos(System.nanoTime() - start);
+            timings.add(new StepTiming(name, duration, requestCount));
+            System.out.printf("  ✅ %s completed in %dms (%d requests)%n", name, duration.toMillis(), requestCount);
+        } catch (Exception e) {
+            Duration duration = Duration.ofNanos(System.nanoTime() - start);
+            timings.add(new StepTiming(name, duration, requestCount));
+            System.out.printf("  ❌ %s failed after %dms%n", name, duration.toMillis());
+            throw e;
+        }
+    }
+
+    @FunctionalInterface
+    interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    private static void printSummary() {
+        System.out.println("\n" + "=".repeat(60));
+        System.out.println("  TIMING SUMMARY");
+        System.out.println("=".repeat(60));
+
+        Duration totalTime = Duration.ZERO;
+        int totalRequests = 0;
+
+        for (StepTiming t : timings) {
+            totalTime = totalTime.plus(t.duration);
+            totalRequests += t.requestCount;
+            System.out.printf("  %-25s %10dms  %4d requests%n", t.name + ":", t.duration.toMillis(), t.requestCount);
+        }
+
+        System.out.println("-".repeat(60));
+        System.out.printf("  %-25s %10dms  %4d requests%n", "TOTAL:", totalTime.toMillis(), totalRequests);
+        System.out.printf("  %-25s %10dms%n", "Avg per request:", totalTime.dividedBy(totalRequests).toMillis());
+        System.out.println("=".repeat(60));
+    }
+
+    @FunctionalInterface
+    interface ThrowingSupplier {
+        boolean get() throws Exception;
+    }
+
+    private static void waitForCondition(Duration timeout, ThrowingSupplier condition) throws Exception {
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        Exception lastException = null;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                if (condition.get()) {
+                    return;
+                }
+            } catch (Exception e) {
+                lastException = e;
+            }
+            Thread.sleep(50);
+        }
+        if (lastException != null) {
+            throw lastException;
+        }
+        throw new Exception("Condition not met within " + timeout.toMillis() + "ms");
+    }
 
     // ============================================================================
     // CLIENT CREATION
     // ============================================================================
 
-    private static CacheClientApi createClient() throws RoomzinException {
-        if ("standalone".equalsIgnoreCase(MODE)) {
-            return getStandaloneClient();
+    private static RoomzinClient createClient() throws RoomzinException {
+        if (MODE.equals("standalone")) {
+            RoomzinConfig cfg = RoomzinConfig.builder()
+                    .withAddr(STANDALONE_HOST)
+                    .withPort(STANDALONE_PORT)
+                    .withMode(ProtocolTypes.Mode.STANDALONE)
+                    .withTimeout(TIMEOUT)
+                    .withKeepAlive(Duration.ofSeconds(30))
+                    .build();
+            return new RoomzinClient(cfg);
         }
-        return getClusterClient();
-    }
 
-    private static CacheClientApi getStandaloneClient() throws RoomzinException {
-        SingleConfig config = SingleConfig.builder()
-                .withHost(STANDALONE_HOST)
-                .withTcpPort(STANDALONE_PORT)
-                .withAuthToken(TOKEN)
-                .withTimeout(TIMEOUT)
-                .build();
-        return new SingleClient(config);
-    }
-
-    private static CacheClientApi getClusterClient() throws RoomzinException {
-        ClusterConfig config = ClusterConfig.builder()
-                .withSeedNodeIds("roomzin-0,roomzin-1,roomzin-2")
-                .withStaticDiscovery(STATIC_DISCOVERY)
-                .withTcpPort(7777)
-                .withApiPort(8080)
-                .withAuthToken(TOKEN)
+        // Router mode
+        RoomzinConfig cfg = RoomzinConfig.builder()
+                .withAddr(ROUTER_HOST)
+                .withPort(ROUTER_PORT)
+                .withMode(ProtocolTypes.Mode.ROUTER)
                 .withTimeout(Duration.ofSeconds(30))
+                .withKeepAlive(Duration.ofSeconds(30))
                 .build();
-        return new ClusterClient(config);
+        return new RoomzinClient(cfg);
     }
 
     // ============================================================================
-    // UTILITY METHODS
-    // ============================================================================
-
-    private static List<String> generateDates(int count) {
-        List<String> dates = new ArrayList<>();
-        for (int i = 0; i < count; i++) {
-            dates.add(LocalDate.now().plusDays(i + 1).format(DATE_FORMATTER));
-        }
-        return dates;
-    }
-
-    private static void waitForCondition(Duration timeout, Condition condition) throws Exception {
-        long deadline = System.currentTimeMillis() + timeout.toMillis();
-        while (System.currentTimeMillis() < deadline) {
-            if (condition.check()) {
-                return;
-            }
-            TimeUnit.MILLISECONDS.sleep(50);
-        }
-        throw new RuntimeException("Condition not met within " + timeout);
-    }
-
-    @FunctionalInterface
-    private interface Condition {
-        boolean check() throws Exception;
-    }
-
-    // ============================================================================
-    // MAIN - CLEAR LINEAR FLOW
+    // MAIN
     // ============================================================================
 
     public static void main(String[] args) {
         System.out.println("=== Roomzin API Example ===");
-        System.out.println("Mode: " + MODE);
-        System.out.println();
+        System.out.printf("Mode: %s%n%n", MODE);
 
         try {
             // -------------------------------------------------------------------------
@@ -131,280 +158,264 @@ public class RoomzinSmoke {
             // -------------------------------------------------------------------------
             System.out.println("[1/8] Connecting to Roomzin...");
 
-            try (CacheClientApi client = createClient()) {
-                System.out.println("  Connected successfully!");
+            RoomzinClient client = createClient();
+            System.out.printf("codecs %s%n", client.getCodecs().getRateFeatures());
 
-                // -------------------------------------------------------------------------
-                // STEP 2: Create properties and verify existence
-                // -------------------------------------------------------------------------
-                System.out.println("[2/8] SetProp...");
+            // -------------------------------------------------------------------------
+            // STEP 2: Create properties and verify existence
+            // -------------------------------------------------------------------------
+            System.out.println("\n[2/8] SetProp...");
 
+            timeStep("SetProp", NUM_SEGMENTS * NUM_PROPS_PER_SEGMENT, () -> {
                 List<String> createdProps = new ArrayList<>();
-                List<String> dates = generateDates(NUM_DAYS);
 
                 for (int s = 1; s <= NUM_SEGMENTS; s++) {
-                    String segment = "seg_" + s;
-                    for (int p = 1; p <= NUM_PROPS_PER_SEGMENT; p++) {
-                        String propId = "seg_" + s + "_p" + p;
+                    String segment = "segment_" + s;
 
-                        SetPropPayload prop = SetPropPayload.builder()
+                    for (int p = 1; p <= NUM_PROPS_PER_SEGMENT; p++) {
+                        String propID = String.format("s%d_seg%d_p%d", SHARD_IDX, s, p);
+
+                        double lat = 40.7128 + p * 0.001;
+                        double lon = -74.0060 + p * 0.001;
+                        List<String> amenities = Arrays.asList("wifi", "pool");
+
+                        client.setProp(segment, SetPropPayload.builder()
                                 .segment(segment)
-                                .area("area_1")
-                                .propertyId(propId)
+                                .area("area_" + SHARD_IDX + "_" + s)
+                                .propertyId(propID)
                                 .propertyType("hotel")
                                 .category("midrange")
                                 .stars((short) 3)
-                                .latitude(40.7128 + p * 0.001)
-                                .longitude(-74.0060 + p * 0.001)
-                                .amenities(Arrays.asList("wifi", "pool"))
-                                .build();
+                                .latitude(lat)
+                                .longitude(lon)
+                                .amenities(amenities)
+                                .build());
 
-                        client.setProp(prop);
-                        createdProps.add(propId);
+                        createdProps.add(propID);
                     }
                 }
 
-                // Check PropExist
-                String p1 = createdProps.get(createdProps.size() - 1);
-                waitForCondition(Duration.ofSeconds(2), () -> client.propExist(p1));
-                System.out.println("  ✓ All properties created, verified " + p1 + " exists");
+                // check PropExist
+                String p1 = createdProps.get(0);
+                String segment = "segment_1";
+                waitForCondition(Duration.ofSeconds(2), () -> {
+                    return client.propExist(segment, p1);
+                });
 
-                // -------------------------------------------------------------------------
-                // STEP 3: Set room packages and verify rooms/dates
-                // -------------------------------------------------------------------------
-                System.out.println("[3/8] SetRoomPkg...");
+            });
+
+            // -------------------------------------------------------------------------
+            // STEP 3: Set room packages and verify rooms/dates
+            // -------------------------------------------------------------------------
+            System.out.println("\n[3/8] SetRoomPkg...");
+
+            timeStep("SetRoomPkg", NUM_SEGMENTS * NUM_PROPS_PER_SEGMENT * NUM_ROOMS_PER_PROP * NUM_DAYS, () -> {
+                List<String> dates = new ArrayList<>();
+                for (int i = 0; i < NUM_DAYS; i++) {
+                    LocalDate date = LocalDate.now().plusDays(i);
+                    dates.add(date.format(DateTimeFormatter.ISO_LOCAL_DATE));
+                }
 
                 for (int s = 1; s <= NUM_SEGMENTS; s++) {
+                    String segment = "segment_" + s;
+
                     for (int p = 1; p <= NUM_PROPS_PER_SEGMENT; p++) {
-                        String propId = "seg_" + s + "_p" + p;
+                        String propID = String.format("s%d_seg%d_p%d", SHARD_IDX, s, p);
 
                         for (int r = 1; r <= NUM_ROOMS_PER_PROP; r++) {
-                            String roomType = "room_" + r;
+                            String roomType = "room" + r;
 
                             for (String date : dates) {
                                 short avail = (short) (10 + p);
                                 int price = 100 + p * 10;
                                 List<String> rateFeatures = Arrays.asList("free_cancellation", "free_wifi");
 
-                                SetRoomPkgPayload roomPkg = SetRoomPkgPayload.builder()
-                                        .propertyId(propId)
+                                client.setRoomPkg(segment, SetRoomPkgPayload.builder()
+                                        .propertyId(propID)
                                         .roomType(roomType)
                                         .date(date)
                                         .availability(avail)
                                         .finalPrice(price)
                                         .rateFeature(rateFeatures)
-                                        .build();
-
-                                client.setRoomPkg(roomPkg);
+                                        .build());
                             }
                         }
                     }
                 }
 
-                // Verify room lists for first property
-                String testProp = "seg_1_p1";
-                List<String> rooms = client.propRoomList(testProp);
-                List<String> expectedRooms = Arrays.asList("room_1", "room_2");
-                Collections.sort(rooms);
-                Collections.sort(expectedRooms);
+                String testProp = String.format("s%d_seg1_p1", SHARD_IDX);
+                String segment = "segment_1";
 
-                if (!rooms.equals(expectedRooms)) {
-                    throw new RuntimeException("Expected " + expectedRooms + " rooms, got " + rooms);
+                List<String> rooms = client.propRoomList(segment, testProp);
+                List<String> expectedRooms = Arrays.asList("room1", "room2", "room3", "room4");
+                if (rooms.size() != expectedRooms.size()) {
+                    throw new Exception("expected " + expectedRooms.size() + " rooms, got " + rooms.size());
                 }
-                System.out.println("  ✓ Room list verified: " + rooms);
 
-                // Verify date lists for first room
-                String testRoom = "room_1";
-                PropRoomDateListPayload dateListPayload = PropRoomDateListPayload.builder()
+                String testRoom = "room1";
+                List<String> dateList = client.propRoomDateList(segment, PropRoomDateListPayload.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
-                        .build();
-                List<String> dateList = client.propRoomDateList(dateListPayload);
+                        .build());
 
                 if (dateList.size() != NUM_DAYS) {
-                    throw new RuntimeException("Expected " + NUM_DAYS + " dates, got " + dateList.size());
+                    throw new Exception("expected " + NUM_DAYS + " dates, got " + dateList.size());
                 }
-                System.out.println("  ✓ Date list verified: " + dateList);
+                System.out.println("        PropRoomDateList: " + dateList);
 
-                // Spot check: get a specific room/day
-                GetRoomDayRequest spotRequest = GetRoomDayRequest.builder()
+                client.getPropRoomDay(segment, GetRoomDayRequest.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
                         .date(dates.get(0))
-                        .build();
-                GetRoomDayResult spotCheck = client.getPropRoomDay(spotRequest);
-                System.out.println("  ✓ Spot check: room/day exists with avail=" + spotCheck.getAvailability() +
-                        ", price=" + spotCheck.getFinalPrice());
+                        .build());
+            });
 
-                // -------------------------------------------------------------------------
-                // STEP 4: Test SetRoomAvl, IncRoomAvl, DecRoomAvl
-                // -------------------------------------------------------------------------
-                System.out.println("[4/8] Update Availability...");
+            // -------------------------------------------------------------------------
+            // STEP 4: Test SetRoomAvl, IncRoomAvl, DecRoomAvl
+            // -------------------------------------------------------------------------
+            System.out.println("\n[4/8] Update Availability...");
 
-                String testDate = dates.get(0);
+            timeStep("Update Availability", 4, () -> {
+                String testDate = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
+                String testProp = String.format("s%d_seg1_p1", SHARD_IDX);
+                String testRoom = "room1";
+                String segment = "segment_1";
 
-                // Get initial availability
-                GetRoomDayRequest getRequest = GetRoomDayRequest.builder()
+                GetRoomDayResult initial = client.getPropRoomDay(segment, GetRoomDayRequest.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
                         .date(testDate)
-                        .build();
-                GetRoomDayResult initial = client.getPropRoomDay(getRequest);
-                System.out.println("  GetPropRoomDay: avail=" + initial.getAvailability() +
-                        ", price=" + initial.getFinalPrice());
+                        .build());
+                System.out.printf("        GetPropRoomDay: avail=%d, price=%d%n", initial.getAvailability(),
+                        initial.getFinalPrice());
 
-                // SetRoomAvl
                 short newAvail = 20;
-                UpdRoomAvlPayload setPayload = UpdRoomAvlPayload.builder()
+                client.setRoomAvl(segment, UpdRoomAvlPayload.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
                         .date(testDate)
                         .amount(newAvail)
-                        .build();
-                short setResult = client.setRoomAvl(setPayload);
-                System.out.println("  SetRoomAvl: " + initial.getAvailability() + " → " + setResult);
+                        .build());
+                System.out.printf("        SetRoomAvl: %d → %d%n", initial.getAvailability(), newAvail);
 
-                // IncRoomAvl
-                UpdRoomAvlPayload incPayload = UpdRoomAvlPayload.builder()
+                short incResult = client.incRoomAvl(segment, UpdRoomAvlPayload.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
                         .date(testDate)
                         .amount((short) 1)
-                        .build();
-                short incResult = client.incRoomAvl(incPayload);
-                System.out.println("  IncRoomAvl: " + newAvail + " → " + incResult);
+                        .build());
+                System.out.printf("        IncRoomAvl: %d → %d%n", newAvail, incResult);
 
-                // DecRoomAvl
-                UpdRoomAvlPayload decPayload = UpdRoomAvlPayload.builder()
+                short decResult = client.decRoomAvl(segment, UpdRoomAvlPayload.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
                         .date(testDate)
                         .amount((short) 1)
-                        .build();
-                short decResult = client.decRoomAvl(decPayload);
-                System.out.println("  DecRoomAvl: " + incResult + " → " + decResult);
+                        .build());
+                System.out.printf("        DecRoomAvl: %d → %d%n", incResult, decResult);
+            });
 
-                // -------------------------------------------------------------------------
-                // STEP 5: Search availability and verify results
-                // -------------------------------------------------------------------------
-                System.out.println("[5/8] SearchAvail...");
+            // -------------------------------------------------------------------------
+            // STEP 5: Search availability and verify results
+            // -------------------------------------------------------------------------
+            System.out.println("\n[5/8] SearchAvail...");
 
+            timeStep("SearchAvail", 1, () -> {
+                String date = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
                 long limit = 100;
                 int maxPrice = 150;
 
-                SearchAvailPayload searchPayload = SearchAvailPayload.builder()
-                        .segment("seg_1")
-                        .roomType("room_1")
-                        .dates(Arrays.asList(dates.get(0)))
+                List<PropertyAvail> results = client.searchAvail("segment_1", SearchAvailPayload.builder()
+                        .segment("segment_1")
+                        .roomType("room1")
+                        .dates(Collections.singletonList(date))
                         .finalPrice(maxPrice)
                         .limit(limit)
-                        .build();
+                        .build());
+                System.out.printf("        Found %d properties with max price %d%n", results.size(), maxPrice);
+            });
 
-                List<PropertyAvail> results = client.searchAvail(searchPayload);
-                System.out.println("  Found " + results.size() + " properties with max price " + maxPrice);
+            // -------------------------------------------------------------------------
+            // STEP 6: Test deletion commands (in sequence)
+            // -------------------------------------------------------------------------
+            System.out.println("\n[6/8] Deletion commands...");
 
-                if (results.isEmpty()) {
-                    throw new RuntimeException("Expected at least one search result");
-                }
+            timeStep("Deletion", 8, () -> {
+                String segment = "segment_1";
+                String testProp = String.format("s%d_seg1_p1", SHARD_IDX);
+                String testRoom = "room1";
+                String testDate = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
 
-                // -------------------------------------------------------------------------
-                // STEP 6: Test deletion commands (in sequence)
-                // -------------------------------------------------------------------------
-                System.out.println("[6/8] Deletion commands...");
-
-                // Create final copies for lambdas
-                final String finalTestProp = testProp;
-                final String finalTestRoom = testRoom;
-                final String finalTestDate = testDate;
-
-                // 6.1: DelRoomDay
-                System.out.println("  DelRoomDay...");
-                DelRoomDayRequest delRoomDayRequest = DelRoomDayRequest.builder()
+                System.out.println("        DelRoomDay...");
+                client.delRoomDay(segment, DelRoomDayRequest.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
                         .date(testDate)
-                        .build();
-                client.delRoomDay(delRoomDayRequest);
+                        .build());
 
-                // Verify date was removed
                 waitForCondition(Duration.ofSeconds(2), () -> {
-                    PropRoomDateListPayload checkPayload = PropRoomDateListPayload.builder()
-                            .propertyId(finalTestProp)
-                            .roomType(finalTestRoom)
-                            .build();
-                    List<String> updatedDateList = client.propRoomDateList(checkPayload);
-                    return !updatedDateList.contains(finalTestDate);
+                    List<String> dateList = client.propRoomDateList(segment, PropRoomDateListPayload.builder()
+                            .propertyId(testProp)
+                            .roomType(testRoom)
+                            .build());
+                    return !dateList.contains(testDate);
                 });
-                System.out.println("  ✓ Date removed successfully");
 
-                // 6.2: DelPropRoom
-                System.out.println("  DelPropRoom...");
-                DelPropRoomPayload delPropRoomPayload = DelPropRoomPayload.builder()
+                System.out.println("        DelPropRoom...");
+                client.delPropRoom(segment, DelPropRoomPayload.builder()
                         .propertyId(testProp)
                         .roomType(testRoom)
-                        .build();
-                client.delPropRoom(delPropRoomPayload);
+                        .build());
 
-                // Verify room was removed
                 waitForCondition(Duration.ofSeconds(2), () -> {
-                    PropRoomExistPayload existPayload = PropRoomExistPayload.builder()
-                            .propertyId(finalTestProp)
-                            .roomType(finalTestRoom)
-                            .build();
-                    boolean exists = client.propRoomExist(existPayload);
-                    return !exists;
+                    return !client.propRoomExist(segment, PropRoomExistPayload.builder()
+                            .propertyId(testProp)
+                            .roomType(testRoom)
+                            .build());
                 });
-                System.out.println("  ✓ Room removed successfully");
 
-                // 6.3: DelProp
-                System.out.println("  DelProp...");
-                client.delProp(testProp);
+                System.out.println("        DelProp...");
+                client.delProp(segment, testProp);
 
-                // Verify property was removed
                 waitForCondition(Duration.ofSeconds(2), () -> {
-                    boolean exists = client.propExist(finalTestProp);
-                    return !exists;
+                    return !client.propExist(segment, testProp);
                 });
-                System.out.println("  ✓ Property removed successfully");
 
-                // 6.4: DelSegment
-                System.out.println("  DelSegment...");
-                client.delSegment("seg_1");
+                System.out.println("        DelSegment...");
+                client.delSegment("segment_1");
 
-                // Verify segment was removed
                 waitForCondition(Duration.ofSeconds(2), () -> {
-                    SearchPropPayload searchPropPayload = SearchPropPayload.builder()
-                            .segment("seg_1")
-                            .build();
-                    List<String> props = client.searchProp(searchPropPayload);
+                    List<String> props = client.searchProp("segment_1", SearchPropPayload.builder()
+                            .segment("segment_1")
+                            .build());
                     return props.isEmpty();
                 });
-                System.out.println("  ✓ Segment removed successfully");
+            });
 
-                // -------------------------------------------------------------------------
-                // STEP 7: Clean up remaining data
-                // -------------------------------------------------------------------------
-                System.out.println("[7/7] Cleaning up...");
+            // -------------------------------------------------------------------------
+            // STEP 7: Clean up remaining data
+            // -------------------------------------------------------------------------
+            System.out.println("\n[7/8] Cleaning up...");
 
-                try {
-                    client.delSegment("seg_2");
-                    System.out.println("  Cleaned up seg_2");
-                } catch (RoomzinException e) {
-                    System.out.println("  Warning: Failed to delete seg_2: " + e.getMessage());
+            timeStep("Cleanup", 3, () -> {
+                for (int s = 2; s <= NUM_SEGMENTS; s++) {
+                    String seg = "segment_" + s;
+                    try {
+                        client.delSegment(seg);
+                        System.out.println("        Cleaned up " + seg);
+                    } catch (RoomzinException e) {
+                        System.out.println("Warning: Failed to delete " + seg + ": " + e.getMessage());
+                    }
                 }
+            });
 
-                System.out.println();
-                System.out.println("✅ All completed successfully!");
-                client.close();
-                System.exit(0);
+            printSummary();
+            System.out.println("\n✅ All completed successfully!");
 
-            } catch (Exception e) {
-                System.err.println("❌ Test failed: " + e.getMessage());
-                e.printStackTrace();
-                System.exit(1);
-            }
+            client.close();
+
         } catch (Exception e) {
-            System.err.println("❌ Fatal error: " + e.getMessage());
+            System.err.println("Fatal error: " + e.getMessage());
             e.printStackTrace();
             System.exit(1);
         }

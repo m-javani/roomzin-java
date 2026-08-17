@@ -696,45 +696,6 @@ public class Commands {
         return new GetRoomDayResult(propId, date, avail, price, rateFeature);
     }
 
-    public static byte[] buildGetSegmentsPayload() {
-        String cmdName = "GETSEGMENTS";
-        Object[] fields = new Object[0];
-        return buildPayload(cmdName, fields);
-    }
-
-    public static List<SegmentInfo> parseGetSegmentsResponse(String status, List<ProtocolTypes.Field> fields)
-            throws RoomzinException {
-        if (!"SUCCESS".equals(status)) {
-            if (!fields.isEmpty() && fields.get(0).fieldType == 0x01) {
-                throw RoomzinException.of(new String(fields.get(0).data, StandardCharsets.UTF_8));
-            }
-            throw RoomzinException.of("RESPONSE_ERROR");
-        }
-        if (fields.size() % 2 != 0) {
-            throw RoomzinException.of("RESPONSE_ERROR: invalid field count: expected pairs of segment and propCount");
-        }
-        List<SegmentInfo> list = new ArrayList<>();
-        for (int i = 0; i < fields.size(); i += 2) {
-            if (fields.get(i).fieldType != 0x01) {
-                throw RoomzinException.of(
-                        "RESPONSE_ERROR: expected string segment at field " + i + ", got type "
-                                + fields.get(i).fieldType);
-            }
-            String segment = new String(fields.get(i).data, StandardCharsets.UTF_8);
-            if (i + 1 >= fields.size()) {
-                throw RoomzinException.of("missing propCount field for segment " + segment);
-            }
-            if (fields.get(i + 1).fieldType != 0x03 || fields.get(i + 1).data.length != 4) {
-                throw RoomzinException.of(
-                        "RESPONSE_ERROR: expected u32 propCount at field " + (i + 1) + ", got type "
-                                + fields.get(i + 1).fieldType);
-            }
-            int propCount = ByteBuffer.wrap(fields.get(i + 1).data).order(ByteOrder.LITTLE_ENDIAN).getInt();
-            list.add(new SegmentInfo(segment, propCount));
-        }
-        return list;
-    }
-
     public static byte[] buildGetCodecsPayload() {
         String cmdName = "GETCODECS";
         Object[] fields = new Object[0];

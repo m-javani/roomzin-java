@@ -1,8 +1,7 @@
-package com.roomzin.roomzinjava.internal.single;
+package com.roomzin.roomzinjava.internal;
 
-import com.roomzin.roomzinjava.client.single.SingleConfig;
+import com.roomzin.roomzinjava.client.RoomzinConfig;
 import com.roomzin.roomzinjava.internal.protocol.Frame;
-import com.roomzin.roomzinjava.internal.protocol.Login;
 import com.roomzin.roomzinjava.internal.protocol.ProtocolTypes;
 import com.roomzin.roomzinjava.internal.protocol.RoomzinException;
 
@@ -20,12 +19,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * SingleHandler manages a single TCP connection to a Roomzin server, handling
- * command execution
- * and response demultiplexing for the single-node client.
+ * Unified handler for Roomzin Java SDK.
+ * Supports both standalone and router modes with a single connection.
  */
-public class SingleHandler {
-    private final SingleConfig config;
+public class RoomzinHandler {
+    private final RoomzinConfig config;
     private Socket socket;
     private BufferedInputStream input;
     private BufferedOutputStream output;
@@ -34,71 +32,83 @@ public class SingleHandler {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private Runnable onReconnect;
+    private volatile boolean keepaliveRunning = false;
+    private Thread keepaliveThread;
 
     public void setOnReconnect(Runnable onReconnect) {
         this.onReconnect = onReconnect;
     }
 
-    // Call this when reconnect happens
     private void triggerReconnect() {
         if (onReconnect != null) {
             onReconnect.run();
         }
     }
 
-    /**
-     * Constructs a SingleHandler with the given configuration, establishing a
-     * connection and starting the read loop.
-     * 
-     * @param config The configuration for the single-node client
-     * @throws RoomzinException If connection or login fails
-     */
-    public SingleHandler(SingleConfig config) throws RoomzinException {
+    public RoomzinHandler(RoomzinConfig config) throws RoomzinException {
         this.config = config;
         reconnect();
         executor.submit(this::readLoop);
+
+        // Start keepalive only in router mode
+        if (config.getMode() == ProtocolTypes.Mode.ROUTER) {
+            startKeepalive();
+        }
     }
 
-    /**
-     * Re-establishes the TCP connection and performs the login handshake.
-     * 
-     * @throws RoomzinException If connection or login fails
-     */
     private void reconnect() throws RoomzinException {
         try {
             if (socket != null && !socket.isClosed()) {
                 socket.close();
             }
-            socket = new Socket(config.getHost(), config.getTcpPort());
+            socket = new Socket(config.getAddr(), config.getPort());
             socket.setKeepAlive(true);
             socket.setSoTimeout((int) config.getTimeout().toMillis());
             output = new BufferedOutputStream(socket.getOutputStream());
             input = new BufferedInputStream(socket.getInputStream());
-
-            // Handshake
-            byte[] payload = Login.buildLoginPayload(config.getAuthToken());
-            byte[] frame = Frame.prependHeader(0, payload);
-            output.write(frame);
-            output.flush();
-
-            byte[] response = new byte[32];
-            int n = input.read(response);
-            String reply = new String(response, 0, n).trim();
-            if (!"LOGIN OK".equals(reply)) {
-                throw RoomzinException.of("Login failed: " + reply);
-            }
         } catch (IOException e) {
             throw RoomzinException.of("Connection error: " + e.getMessage());
         }
     }
 
-    /**
-     * Closes the handler, shutting down the executor and socket.
-     * 
-     * @throws IOException If socket closure fails
-     */
+    private void startKeepalive() {
+        if (keepaliveRunning)
+            return;
+        keepaliveRunning = true;
+
+        keepaliveThread = new Thread(() -> {
+            while (!closed.get() && keepaliveRunning) {
+                try {
+                    Thread.sleep(config.getKeepAliveSec().toMillis()); // 10 seconds
+                    if (!closed.get() && socket != null && !socket.isClosed()) {
+                        byte[] frame = Frame.buildKeepaliveFrame(0);
+                        output.write(frame);
+                        output.flush();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (IOException e) {
+                    // Connection issue - will be handled by reconnect
+                    break;
+                }
+            }
+        });
+        keepaliveThread.setDaemon(true);
+        keepaliveThread.start();
+    }
+
+    private void stopKeepalive() {
+        keepaliveRunning = false;
+        if (keepaliveThread != null) {
+            keepaliveThread.interrupt();
+            keepaliveThread = null;
+        }
+    }
+
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
+            stopKeepalive();
             executor.shutdownNow();
             if (socket != null && !socket.isClosed()) {
                 socket.close();
@@ -106,20 +116,12 @@ public class SingleHandler {
         }
     }
 
-    /**
-     * Sends a command payload and waits for its response.
-     * 
-     * @param payload The command payload to send
-     * @return The raw result containing status and fields
-     * @throws RoomzinException If the handler is closed, write fails, or
-     *                          interrupted
-     */
-    public ProtocolTypes.RawResult roundTrip(byte[] payload) throws RoomzinException {
+    public ProtocolTypes.RawResult execute(String segment, boolean isWrite, byte[] payload) throws RoomzinException {
         if (closed.get()) {
             throw RoomzinException.of("Handler closed");
         }
 
-        // Self-heal if disconnected
+        // Self-heal
         if (socket == null || socket.isClosed()) {
             reconnect();
         }
@@ -129,7 +131,12 @@ public class SingleHandler {
         demux.put(clrId, queue);
 
         try {
-            byte[] frame = Frame.prependHeader(clrId, payload);
+            byte[] frame;
+            if (config.getMode() == ProtocolTypes.Mode.ROUTER) {
+                frame = Frame.prependRouterHeader(segment, isWrite, clrId, payload);
+            } else {
+                frame = Frame.prependHeader(clrId, payload);
+            }
             output.write(frame);
             output.flush();
         } catch (IOException e) {
@@ -149,10 +156,6 @@ public class SingleHandler {
         }
     }
 
-    /**
-     * Continuously reads frames from the input stream, parses them, and routes
-     * responses to the appropriate queue.
-     */
     private void readLoop() {
         while (!closed.get()) {
             try {
@@ -160,7 +163,6 @@ public class SingleHandler {
                 ProtocolTypes.Header hdr = frameData.header;
                 byte[] payload = frameData.payload;
 
-                // Parse payload into fields
                 int statusLen = Byte.toUnsignedInt(payload[0]);
                 if (payload.length < 1 + statusLen + 2) {
                     throw RoomzinException.of("Short frame: missing status or field count");
@@ -169,7 +171,6 @@ public class SingleHandler {
                 System.arraycopy(payload, 1 + statusLen + 2, fieldsData, 0, fieldsData.length);
                 List<ProtocolTypes.Field> fields = Frame.parseFields(fieldsData, hdr.fieldCnt);
 
-                // Route response to the corresponding queue
                 ArrayBlockingQueue<ProtocolTypes.RawResult> queue = demux.get(hdr.clrId);
                 if (queue != null) {
                     queue.put(new ProtocolTypes.RawResult(hdr.status, fields));
@@ -186,7 +187,6 @@ public class SingleHandler {
                     }
                 });
                 demux.clear();
-                // Connection lost - invalidate codecs
                 triggerReconnect();
                 try {
                     reconnect();
