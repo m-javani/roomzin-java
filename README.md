@@ -2,25 +2,26 @@
 
 Official Java SDK for [Roomzin](https://m-javani.github.io/roomzin-doc/) — a high-performance in-memory inventory engine for booking platforms.
 
-The SDK provides a clean, idiomatic Java interface for communicating with Roomzin servers in both standalone and clustered deployments. It automatically manages routing, failover, connection pooling, and cluster topology changes.
+The SDK provides a clean, idiomatic Java interface for communicating with Roomzin servers in both standalone and clustered deployments. It automatically handles connection management, request/response demuxing, and self-healing reconnections.
 
 ---
 
 ## Features
 
-- Automatic request routing (leader for writes, followers for reads)
-- Built-in failover and cluster discovery
-- Connection pooling
-- Standalone and clustered deployment support
+- Unified client for standalone and router (cluster) modes
+- Built-in connection self-healing
+- Automatic request routing (writes to leader, reads to followers) via router
 - Fully typed Java API
 - AutoCloseable client for resource management
+- Type-safe API with segment support
 
 ---
 
 ## Requirements
 
-- Java 8 or later
+- Java 11 or later
 - Roomzin Server v1.x
+- Roomzin Router (for cluster mode)
 
 ---
 
@@ -32,102 +33,94 @@ The SDK provides a clean, idiomatic Java interface for communicating with Roomzi
 <dependency>
     <groupId>io.github.m-javani</groupId>
     <artifactId>roomzin-java</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```gradle
-implementation 'com.roomzin:roomzin-java:1.0.0'
+implementation 'io.github.m-javani:roomzin-java:2.0.0'
 ```
 
 ---
 
 ## Client Setup
 
-### Standalone
+### Standalone Mode
+
+Connect directly to a standalone Roomzin server:
 
 ```java
-import com.roomzin.roomzinjava.single.SingleClient;
-import com.roomzin.roomzinjava.api.CacheClientApi;
+import com.roomzin.roomzinjava.client.RoomzinClient;
+import com.roomzin.roomzinjava.client.RoomzinConfig;
+import com.roomzin.roomzinjava.internal.protocol.Mode;
 import java.time.Duration;
 
-CacheClientApi client = SingleConfig.builder()
-    .withHost("127.0.0.1")
-    .withTcpPort(7777)
-    .withAuthToken("abc123")
-    .withTimeout(Duration.ofSeconds(5))
-    .withKeepAlive(Duration.ofSeconds(30))
+RoomzinConfig config = RoomzinConfig.builder()
+    .addr("127.0.0.1")
+    .port(7777)
+    .mode(Mode.STANDALONE)
+    .timeout(Duration.ofSeconds(5))
+    .keepAlive(Duration.ofSeconds(30))
     .build();
+
+RoomzinClient client = new RoomzinClient(config);
+client.connect();
 
 // Use client...
 client.close();
 ```
 
-### Cluster (Static Discovery)
+### Cluster Mode (via Router)
+
+Connect to a Roomzin cluster through the router:
 
 ```java
-import com.roomzin.roomzinjava.cluster.ClusterClient;
-import com.roomzin.roomzinjava.cluster.ClusterConfig;
-import com.roomzin.roomzinjava.types.NodeAddr;
+import com.roomzin.roomzinjava.client.RoomzinClient;
+import com.roomzin.roomzinjava.client.RoomzinConfig;
+import com.roomzin.roomzinjava.internal.protocol.Mode;
 import java.time.Duration;
-import java.util.Arrays;
-import java.util.List;
 
-List<NodeAddr> staticDiscovery = Arrays.asList(
-    new NodeAddr("roomzin-0", "172.20.0.10", 7777, 8080),
-    new NodeAddr("roomzin-1", "172.20.0.11", 7777, 8080),
-    new NodeAddr("roomzin-2", "172.20.0.12", 7777, 8080)
-);
-
-ClusterConfig cfg = ClusterConfig.builder()
-    .withSeedNodeIds("roomzin-0, roomzin-1, roomzin-2")
-    .withStaticDiscovery(staticDiscovery)
-    .withTcpPort(7777)
-    .withApiPort(8080)
-    .withAuthToken("abc123")
-    .withTimeout(Duration.ofSeconds(5))
-    .withKeepAlive(Duration.ofSeconds(30))
+RoomzinConfig config = RoomzinConfig.builder()
+    .addr("router.example.com")
+    .port(9200)
+    .mode(Mode.ROUTER)
+    .timeout(Duration.ofSeconds(30))
+    .keepAlive(Duration.ofSeconds(30))
     .build();
 
-CacheClientApi client = ClusterClient.create(cfg);
+RoomzinClient client = new RoomzinClient(config);
+client.connect();
 client.close();
-```
-
-### Cluster (HTTP Discovery)
-
-```java
-ClusterConfig cfg = ClusterConfig.builder()
-    .withSeedNodeIds("roomzin-0, roomzin-1, roomzin-2")
-    .withHttpDiscovery("http://discovery-service:8080/nodes")
-    .withTcpPort(7777)
-    .withApiPort(8080)
-    .withAuthToken("abc123")
-    .withTimeout(Duration.ofSeconds(5))
-    .withKeepAlive(Duration.ofSeconds(30))
-    .build();
-
-CacheClientApi client = ClusterClient.create(cfg);
 ```
 
 ---
 
-## Discovery Configuration
+## Configuration Options
 
-Roomzin SDKs need to know how to reach each Roomzin node in the cluster. The cluster nodes communicate with each other using internal address resolvers, but the SDK as an external client needs actual network addresses (IP:port or hostname:port) to connect.
+| Option | Description | Default |
+|--------|-------------|---------|
+| `addr()` | Server or router address | Required |
+| `port()` | TCP port | Required |
+| `mode()` | `Mode.STANDALONE` or `Mode.ROUTER` | `Mode.STANDALONE` |
+| `timeout()` | Request timeout | 2s |
+| `keepAlive()` | TCP keep-alive interval | 30s |
 
-The SDK fetches the cluster topology from the Roomzin cluster itself. This topology includes the node identities of the leader and followers. The SDK then uses discovery to resolve these node identities into actual network addresses.
+---
 
-Two discovery modes are supported:
+## Segment Routing
 
-### Static Discovery
+In cluster mode, every request must specify a segment. The router uses this to route the request to the correct shard.
 
-The SDK gets the mapping once in config and never updates it. Use this when your cluster nodes have stable, predictable addresses.
+```java
+String segment = "us-east";
 
-### HTTP Discovery
+// All API methods accept segment as a parameter
+client.setProp(segment, payload);
+```
 
-The SDK periodically fetches the mapping from an HTTP endpoint. Use this when cluster nodes are dynamic (e.g., Kubernetes pods with changing IPs).
+In standalone mode, the segment parameter is ignored but still required for API compatibility. This allows you to switch between standalone and cluster modes without changing your business logic.
 
 ---
 
@@ -137,7 +130,7 @@ The SDK periodically fetches the mapping from an HTTP endpoint. Use this when cl
 Adds or updates a property.
 
 ```java
-client.setProp(SetPropPayload.builder()
+client.setProp("downtown", SetPropPayload.builder()
     .segment("downtown")
     .area("manhattan")
     .propertyId("hotel_123")
@@ -155,18 +148,18 @@ Searches properties by segment, area, type, or location.
 
 ```java
 // By segment
-List<String> ids = client.searchProp(SearchPropPayload.builder()
+List<String> ids = client.searchProp("downtown", SearchPropPayload.builder()
     .segment("downtown")
     .build());
 
 // By area
-List<String> ids = client.searchProp(SearchPropPayload.builder()
+List<String> ids = client.searchProp("downtown", SearchPropPayload.builder()
     .segment("downtown")
     .area("manhattan")
     .build());
 
 // By location (radius search)
-List<String> ids = client.searchProp(SearchPropPayload.builder()
+List<String> ids = client.searchProp("downtown", SearchPropPayload.builder()
     .segment("downtown")
     .latitude(40.7128)
     .longitude(-74.0060)
@@ -177,14 +170,14 @@ List<String> ids = client.searchProp(SearchPropPayload.builder()
 Checks if a property exists.
 
 ```java
-boolean exists = client.propExist("hotel_123");
+boolean exists = client.propExist("downtown", "hotel_123");
 ```
 
 ### propRoomExist
 Checks if a specific room type exists for a property.
 
 ```java
-boolean exists = client.propRoomExist(PropRoomExistPayload.builder()
+boolean exists = client.propRoomExist("downtown", PropRoomExistPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .build());
@@ -194,14 +187,14 @@ boolean exists = client.propRoomExist(PropRoomExistPayload.builder()
 Lists all room types for a property.
 
 ```java
-List<String> rooms = client.propRoomList("hotel_123");
+List<String> rooms = client.propRoomList("downtown", "hotel_123");
 ```
 
 ### propRoomDateList
 Lists dates with availability data for a property and room type.
 
 ```java
-List<String> dates = client.propRoomDateList(PropRoomDateListPayload.builder()
+List<String> dates = client.propRoomDateList("downtown", PropRoomDateListPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .build());
@@ -215,7 +208,7 @@ List<String> dates = client.propRoomDateList(PropRoomDateListPayload.builder()
 Sets availability, price, and rate features for a room type on a date.
 
 ```java
-client.setRoomPkg(SetRoomPkgPayload.builder()
+client.setRoomPkg("downtown", SetRoomPkgPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .date("2026-07-20")
@@ -229,7 +222,7 @@ client.setRoomPkg(SetRoomPkgPayload.builder()
 Sets exact availability for a room type on a specific date.
 
 ```java
-short newAvail = client.setRoomAvl(UpdRoomAvlPayload.builder()
+short newAvail = client.setRoomAvl("downtown", UpdRoomAvlPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .date("2026-07-20")
@@ -241,7 +234,7 @@ short newAvail = client.setRoomAvl(UpdRoomAvlPayload.builder()
 Increases availability (e.g., on cancellation).
 
 ```java
-short newAvail = client.incRoomAvl(UpdRoomAvlPayload.builder()
+short newAvail = client.incRoomAvl("downtown", UpdRoomAvlPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .date("2026-07-20")
@@ -253,7 +246,7 @@ short newAvail = client.incRoomAvl(UpdRoomAvlPayload.builder()
 Decreases availability (e.g., on booking).
 
 ```java
-short newAvail = client.decRoomAvl(UpdRoomAvlPayload.builder()
+short newAvail = client.decRoomAvl("downtown", UpdRoomAvlPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .date("2026-07-20")
@@ -265,7 +258,7 @@ short newAvail = client.decRoomAvl(UpdRoomAvlPayload.builder()
 Gets availability and pricing for a specific room on a specific date.
 
 ```java
-GetRoomDayResult day = client.getPropRoomDay(GetRoomDayRequest.builder()
+GetRoomDayResult day = client.getPropRoomDay("downtown", GetRoomDayRequest.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .date("2026-07-20")
@@ -281,7 +274,7 @@ System.out.println("Avail: " + day.getAvailability() + ", Price: " + day.getFina
 Searches available rooms by filters.
 
 ```java
-List<PropertyAvail> results = client.searchAvail(SearchAvailPayload.builder()
+List<PropertyAvail> results = client.searchAvail("downtown", SearchAvailPayload.builder()
     .segment("downtown")
     .roomType("suite")
     .dates(Arrays.asList("2026-07-20", "2026-07-21"))
@@ -301,16 +294,6 @@ for (PropertyAvail result : results) {
 }
 ```
 
-### getSegments
-Lists all active segments with their property counts.
-
-```java
-List<SegmentInfo> segments = client.getSegments();
-for (SegmentInfo seg : segments) {
-    System.out.println(seg.getSegment() + ": " + seg.getCount() + " properties");
-}
-```
-
 ### getCodecs
 Gets the current codec registry (used internally for validation).
 
@@ -327,7 +310,7 @@ System.out.println(codecs.getRateFeatures());
 Deletes availability for a specific room on a specific date.
 
 ```java
-client.delRoomDay(DelRoomDayRequest.builder()
+client.delRoomDay("downtown", DelRoomDayRequest.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .date("2026-07-20")
@@ -338,7 +321,7 @@ client.delRoomDay(DelRoomDayRequest.builder()
 Deletes all data for a property on a specific date.
 
 ```java
-client.delPropDay(DelPropDayRequest.builder()
+client.delPropDay("downtown", DelPropDayRequest.builder()
     .propertyId("hotel_123")
     .date("2026-07-20")
     .build());
@@ -348,7 +331,7 @@ client.delPropDay(DelPropDayRequest.builder()
 Deletes a room type from a property.
 
 ```java
-client.delPropRoom(DelPropRoomPayload.builder()
+client.delPropRoom("downtown", DelPropRoomPayload.builder()
     .propertyId("hotel_123")
     .roomType("suite")
     .build());
@@ -358,7 +341,7 @@ client.delPropRoom(DelPropRoomPayload.builder()
 Deletes an entire property.
 
 ```java
-client.delProp("hotel_123");
+client.delProp("downtown", "hotel_123");
 ```
 
 ### delSegment
@@ -378,7 +361,7 @@ All methods throw `RoomzinException`. Use the helper methods to classify errors:
 import com.roomzin.roomzinjava.internal.protocol.RoomzinException;
 
 try {
-    client.setRoomPkg(payload);
+    client.setRoomPkg("downtown", payload);
 } catch (RoomzinException e) {
     if (e.isRequest()) {
         // Business rule violation - fix the request
@@ -386,7 +369,7 @@ try {
     } else if (e.isRetry()) {
         // Temporary condition - retry with backoff
         Thread.sleep(100);
-        client.setRoomPkg(payload);
+        client.setRoomPkg("downtown", payload);
     } else if (e.isClient()) {
         // Authentication or protocol errors
         System.out.println("Client error: " + e.getMessage());
@@ -406,7 +389,7 @@ try {
 |----------|-------------|--------|
 | **Client** | Authentication or protocol errors | Check credentials and configuration |
 | **Request** | Invalid input or business rule violation | Fix request, don't retry |
-| **Retry** | Temporary server condition (429, 503, 308) | Retry with backoff |
+| **Retry** | Temporary server condition (429, 503) | Retry with backoff |
 | **Internal** | Unexpected server response | Log and investigate |
 
 ---
@@ -417,21 +400,15 @@ Create a **single client** during application startup and reuse it throughout yo
 
 ```java
 // ✅ Good - create once, reuse
-CacheClientApi client = SingleConfig.builder()
-    .withHost("127.0.0.1")
-    .withTcpPort(7777)
-    .withAuthToken("abc123")
-    .build();
+RoomzinClient client = new RoomzinClient(config);
+client.connect();
 // Use client everywhere...
 client.close();
 
 // ❌ Bad - creating per request
 for (Request req : requests) {
-    CacheClientApi client = SingleConfig.builder() // Don't do this
-        .withHost("127.0.0.1")
-        .withTcpPort(7777)
-        .build();
-    client.setRoomPkg(req);
+    RoomzinClient client = new RoomzinClient(config); // Don't do this
+    client.setRoomPkg("downtown", req);
     client.close();
 }
 ```
@@ -440,9 +417,55 @@ The client is safe for concurrent use and manages TCP connections internally.
 
 ---
 
-## API Reference
+## Architecture
 
-For the complete interface definition, see [`CacheClientApi.java`](src/main/java/com/roomzin/roomzinjava/api/CacheClientApi.java). All types are documented with Javadoc comments.
+### Standalone Mode
+
+```
+[SDK] → [Standalone Server]
+```
+
+- Single TCP connection
+- Direct communication
+- Self-healing on disconnection
+
+### Cluster Mode
+
+```
+[SDK] → [Router] → [Shard Leader/Followers]
+```
+
+- SDK sends segment and isWrite flag in header
+- Router routes writes to leader, reads to followers
+- Router handles cluster topology
+- SDK maintains single connection to router
+
+### Protocol
+
+The SDK uses a framed binary protocol:
+
+**Standalone Frame:**
+```
+[0xFF][ClrID(4)][TotalLen(4)][Payload]
+```
+
+**Router Frame:**
+```
+[0xFE][TotalLen(4)][SegmentLen(1)][Segment(n)][IsWrite(1)][ShardFrame]
+```
+
+Where `ShardFrame` is the standalone frame format.
+
+---
+
+## Examples
+
+A complete smoke example is available in the `examples/java/` directory. It demonstrates the SDK's core features and can be run as a reference implementation or to verify your Roomzin setup.
+
+```bash
+cd examples/java
+mvn clean compile exec:java
+```
 
 ---
 
@@ -451,33 +474,6 @@ For the complete interface definition, see [`CacheClientApi.java`](src/main/java
 For Roomzin concepts, deployment, and administration:
 
 [https://m-javani.github.io/roomzin-doc/docs.html](https://m-javani.github.io/roomzin-doc/docs.html)
-
----
-
-## Examples
-
-Check out the [`examples/java/`](examples/java/) directory for a complete runnable example project.
-
-### Quick Start
-
-1. Clone this repository or copy the `examples/java/` directory
-2. Update the configuration in `RoomzinSmoke.java`:
-   - Change `MODE` to `"standalone"` or `"cluster"`
-   - Update `STATIC_DISCOVERY` with your cluster node IPs
-   - Adjust `STANDALONE_HOST` and `STANDALONE_PORT` if needed
-   - Update `TOKEN` to match your Roomzin configuration
-3. Run the example:
-   ```bash
-   cd examples/java
-   mvn clean compile exec:java
-   ```
-
-The example demonstrates all major API operations:
-- Property creation and management
-- Room package setup
-- Availability updates (set, increment, decrement)
-- Search and query
-- Delete operations
 
 ---
 
@@ -510,5 +506,3 @@ This SDK is licensed under the [BUSL-1.1 License](LICENSE).
 
 - [Roomzin Quickstart](https://github.com/m-javani/roomzin-quickstart) — Local Docker cluster
 - [Roomzin Bench](https://github.com/m-javani/roomzin-bench) — Benchmarking tool
-
----
